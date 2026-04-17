@@ -73,6 +73,8 @@ class RemoveServerHeaderMiddleware(BaseHTTPMiddleware):
         return response
 
 
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
 async def verify_proxy_key(request: Request, key: str = Security(api_key_header)) -> bool:
     if request.url.path == "/health":
         return True

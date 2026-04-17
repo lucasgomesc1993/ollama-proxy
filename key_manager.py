@@ -274,3 +274,9 @@ class KeyManager:
             lines.append(f"ID: {k.id:<10} | Status: {status_info:<20} | Requests: {k.request_count}")
         lines.append("-------------------------------\n")
         return "\n".join(lines)
+
+    def _get_key_rate_limit(self, key_id: str) -> int:
+        for ck in self.config.keys:
+            if ck.id == key_id:
+                return ck.rate_limit_per_minute if ck.rate_limit_per_minute > 0 else self.config.rate_limit_per_minute
+        return self.config.rate_limit_per_minute
