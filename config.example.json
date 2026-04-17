@@ -1,0 +1,44 @@
+{
+  "base_url": "https://ollama.com",
+  "keys": [
+    {
+      "id": "example-key-1",
+      "api_key": "YOUR_API_KEY_HERE",
+      "priority": 1
+    }
+  ],
+  "cooldown_minutes": 60,
+  "max_retries": 2,
+  "rotation_mode": "failover",
+  "rotation_every_n": 5,
+  "rate_limit_per_minute": 15,
+  "jitter_enabled": true,
+  "jitter_min_ms": 200,
+  "jitter_max_ms": 1500,
+  "session_sticky_minutes": 5,
+  "proxy_auth": {
+    "enabled": false,
+    "api_key": ""
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 11434
+  },
+  "timeouts": {
+    "connect": 30.0,
+    "read": 120.0,
+    "read_stream": null,
+    "write": 30.0,
+    "pool": 30.0
+  },
+  "cors": {
+    "allow_origins": ["http://localhost:3000", "http://localhost:11434"],
+    "allow_methods": ["*"],
+    "allow_headers": ["*"]
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file": null
+  }
+}
