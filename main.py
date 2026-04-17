@@ -4,11 +4,13 @@ import logging
 import random
 import re
 import time
+import hashlib
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from fastapi.security import APIKeyHeader
+from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -20,6 +22,14 @@ from dependencies import set_app_state, get_app_config, get_key_manager
 # Constants
 MODEL_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_\-\.:/]+$')
 MAX_MODEL_NAME_LENGTH = 128
+
+# Cache de modelos disponíveis no upstream (para validação)
+_available_models_cache = {"models": set(), "last_updated": 0, "ttl": 300}
+
+def generate_model_digest(model_id: str) -> str:
+    """Gera um digest consistente baseado no model_id para parecer legítimo."""
+    # Usar hash do model_id para parecer consistente mas não óbvio
+    return hashlib.sha256(model_id.encode()).hexdigest()[:64]
 
 # Logging Setup
 def setup_logging(config):
@@ -47,8 +57,20 @@ CONNECTION_LIMITS = httpx.Limits(
     keepalive_expiry=30.0
 )
 
-# Proxy Authentication
-api_key_header = APIKeyHeader(name="X-Proxy-Key", auto_error=False)
+# Esconder identidade do Proxy - remover Server header FastAPI
+# FastAPI usa X-Powered-By e Server, precisamos interceptar
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class RemoveServerHeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        # Remover headers que identificam como proxy
+        headers_to_remove = ['server', 'x-powered-by']
+        for header in headers_to_remove:
+            if header in response.headers:
+                del response.headers[header]
+        return response
 
 
 async def verify_proxy_key(request: Request, key: str = Security(api_key_header)) -> bool:
@@ -84,7 +106,13 @@ async def lifespan(app: FastAPI):
     await key_manager.save_state()
 
 
-app = FastAPI(lifespan=lifespan, title="Ollama Proxy Gateway")
+app = FastAPI(
+    lifespan=lifespan, 
+    title="Ollama API",
+    # Esconder identidade do Proxy - remover Server header FastAPI
+    docs_url="/docs" if app_config.logging.verbose else None,
+    redoc_url="/redoc" if app_config.logging.verbose else None,
+)
 
 # CORS Middleware
 app.add_middleware(
@@ -94,6 +122,9 @@ app.add_middleware(
     allow_methods=app_config.cors.allow_methods,
     allow_headers=app_config.cors.allow_headers,
 )
+
+# Middleware para remover headers que identificam como proxy
+app.add_middleware(RemoveServerHeaderMiddleware)
 
 # Dashboard Routes
 app.include_router(dashboard_router)
@@ -144,19 +175,53 @@ async def get_tags(_: bool = Depends(verify_proxy_key)):
                 ollama_models = []
                 for m in cloud_models:
                     model_id = m.get("id")
+                    # Gerar digest legítimo baseado no model_id
+                    digest = generate_model_digest(model_id)
+                    
+                    # Extrair tamanho real se disponível
+                    size = m.get("size", 0) or 0
+                    
+                    # Parse do ID para tentar inferir família e formato
+                    model_lower = model_id.lower()
+                    family = "llama"
+                    if "qwen" in model_lower:
+                        family = "qwen"
+                    elif "mistral" in model_lower:
+                        family = "mistral"
+                    elif "deepseek" in model_lower:
+                        family = "deepseek"
+                    elif "gemma" in model_lower:
+                        family = "gemma"
+                    elif "phi" in model_lower:
+                        family = "phi"
+                    
+                    # Tentar extrair parâmetros do nome
+                    param_size = "N/A"
+                    for prefix in ["7b", "8b", "13b", "14b", "32b", "70b", "405b"]:
+                        if prefix in model_lower:
+                            param_size = prefix.upper()
+                            break
+                    
+                    # Detectar quantização
+                    quant_level = "N/A"
+                    for q in ["q4_0", "q4_k_m", "q5_0", "q5_k_m", "q8_0", "q8", "fp16", "fp32"]:
+                        if q in model_lower:
+                            quant_level = q.upper()
+                            break
+                    
                     ollama_models.append({
-                        "name": f"{model_id} (Proxy)",
-                        "model": f"{model_id}",
+                        "name": model_id,  # Remover "(Proxy)" que identifica proxy
+                        "model": model_id,
                         "modified_at": "2024-01-01T00:00:00Z",
-                        "size": 0,
-                        "digest": "cloud-model",
+                        "size": size,
+                        "digest": digest,
                         "details": {
                             "parent_model": "",
                             "format": "gguf",
-                            "family": "llama",
-                            "families": ["llama"],
-                            "parameter_size": "N/A",
-                            "quantization_level": "N/A"
+                            "family": family,
+                            "families": [family],
+                            "parameter_size": param_size,
+                            "quantization_level": quant_level
                         }
                     })
                 
@@ -171,27 +236,78 @@ async def get_tags(_: bool = Depends(verify_proxy_key)):
     return MODEL_CACHE["data"] or {"models": []}
 
 
-def extract_model_from_body(body: bytes) -> str:
+def generate_model_digest(model_id: str) -> str:
+    """Gera um digest consistente baseado no model_id para parecer legítimo."""
+    # Usar hash do model_id para parecer consistente mas não óbvio
+    return hashlib.sha256(model_id.encode()).hexdigest()[:64]
+
+
+async def get_available_models(config, km) -> set:
+    """Busca e cacheia modelos disponíveis no upstream para validação."""
+    global _available_models_cache
+    current_time = time.time()
+    
+    if current_time - _available_models_cache["last_updated"] < _available_models_cache["ttl"]:
+        return _available_models_cache["models"]
+    
+    try:
+        active_key = await km.get_active_key()
+        headers = {"Authorization": f"Bearer {active_key.api_key.strip()}"}
+        models_url = f"{config.base_url.rstrip('/')}/v1/models"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(models_url, headers=headers)
+            if resp.status_code == 200:
+                cloud_models = resp.json().get("data", [])
+                models_set = {m.get("id") for m in cloud_models if m.get("id")}
+                _available_models_cache["models"] = models_set
+                _available_models_cache["last_updated"] = current_time
+                return models_set
+    except Exception as e:
+        logger.debug(f"Could not fetch available models: {e}")
+    
+    return _available_models_cache["models"]
+
+
+def extract_model_from_body(body: bytes) -> tuple:
+    """Extrai o nome do modelo do body e retorna (model, error)."""
     try:
         if body:
             data = json.loads(body)
             model = data.get("model", "unknown")
             
             if not isinstance(model, str):
-                return "unknown"
+                return None, Response(
+                    content=json.dumps({"error": "model must be a string"}),
+                    status_code=400
+                )
             if len(model) > MAX_MODEL_NAME_LENGTH:
-                logger.warning(f"Model name too long, truncating")
-                model = model[:MAX_MODEL_NAME_LENGTH]
+                logger.warning(f"Model name too long: {model[:20]}...")
+                return None, Response(
+                    content=json.dumps({"error": "model name too long"}),
+                    status_code=400
+                )
             if not MODEL_NAME_PATTERN.match(model):
                 logger.warning(f"Invalid model name format: {model}")
-                return "unknown"
+                return None, Response(
+                    content=json.dumps({"error": "invalid model name format"}),
+                    status_code=400
+                )
             
-            return model
+            # Retorna o modelo sem validar se existe (validação feita em forward_request)
+            return model, None
     except json.JSONDecodeError:
-        pass
+        return None, Response(
+            content=json.dumps({"error": "invalid JSON in request body"}),
+            status_code=400
+        )
     except Exception as e:
         logger.debug(f"Error extracting model: {e}")
-    return "unknown"
+        return None, Response(
+            content=json.dumps({"error": "could not parse model from request"}),
+            status_code=400
+        )
+    return None, None
 
 
 def extract_usage_from_response(content: bytes) -> dict:
@@ -266,14 +382,19 @@ async def forward_request(request: Request, path: str):
     method = request.method
     body = await request.body()
     
+    # Headers autênticos do Ollama para evitar detecção como proxy
     clean_headers = {
-        "Accept": "application/json",
+        "Accept": request.headers.get("Accept", "application/json"),
+        "Accept-Encoding": request.headers.get("Accept-Encoding", "gzip, deflate, br"),
         "Content-Type": request.headers.get("Content-Type", "application/json"),
-        "User-Agent": "Ollama/0.5.7 (Proxy; FastAPI)",
+        "User-Agent": request.headers.get("User-Agent", "ollama/0.5.7"),
     }
     
-    if "X-Request-Id" in request.headers:
-        clean_headers["X-Request-Id"] = request.headers["X-Request-Id"]
+    # Propagar headers relevantes do cliente (X-Ollama-* e outros identificadores)
+    for header_name in request.headers:
+        header_lower = header_name.lower()
+        if header_lower.startswith("x-ollama-") or header_lower in ["x-request-id"]:
+            clean_headers[header_name] = request.headers[header_name]
 
     model_name = extract_model_from_body(body)
     attempts = 0
@@ -328,11 +449,11 @@ async def forward_request(request: Request, path: str):
                     )
                     response_stream = await client.send(req, stream=True)
                     
-                    if response_stream.status_code == 429:
+                    if response_stream.status_code == 429 or response_stream.status_code == 529:
                         await response_stream.aclose()
                         await client.aclose()
                         await km.mark_quota_exceeded(active_key.id)
-                        raise httpx.HTTPStatusError("Quota Exceeded", request=req, response=response_stream)
+                        raise httpx.HTTPStatusError("Quota Exceeded" if response_stream.status_code == 429 else "Overloaded", request=req, response=response_stream)
                     
                     if response_stream.status_code != 200:
                         error_body = await response_stream.aread()
@@ -426,15 +547,27 @@ async def forward_request(request: Request, path: str):
 
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             is_429 = getattr(exc, 'response', None) and exc.response.status_code == 429
-            if is_429 or isinstance(exc, httpx.RequestError):
+            is_529 = getattr(exc, 'response', None) and exc.response.status_code == 529
+            is_5xx = getattr(exc, 'response', None) and 500 <= exc.response.status_code < 600
+            
+            # Mapear erro 529 (Overloaded) para cooldown da chave
+            if is_529:
+                await km.mark_quota_exceeded(active_key.id)
+                logger.warning(f"Key {active_key.id} returned 529 Overloaded. Cooling down.")
+            
+            # Delay adaptativo após erros 429/529/5xx
+            if is_429 or is_529 or is_5xx or isinstance(exc, httpx.RequestError):
                 attempts += 1
                 if attempts <= max_retries:
-                    wait_time = 0.5 * (2 ** (attempts - 1))
-                    logger.warning(f"Upstream error ({exc}). Retrying in {wait_time}s...")
+                    # Backoff exponencial com jitter para evitar padrões
+                    base_wait = 0.5 * (2 ** (attempts - 1))
+                    jitter = random.uniform(0, 1.0) if config.jitter_enabled else 0
+                    wait_time = base_wait + jitter
+                    logger.warning(f"Upstream error ({exc}). Retrying in {wait_time:.2f}s...")
                     await asyncio.sleep(wait_time)
                     continue
             
-            if is_429:
+            if is_429 or is_529:
                 return Response(content=json.dumps({"error": "All keys exceeded quota after retries."}), status_code=429)
             raise HTTPException(status_code=502, detail=f"Error contacting Ollama API: {str(exc)}")
         

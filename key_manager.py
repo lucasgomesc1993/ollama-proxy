@@ -105,11 +105,24 @@ class KeyManager:
                 kid, status, cooldown_until, req_count, last_used = row
                 for key in self.keys:
                     if key.id == kid:
+                        # Preservar status EXCETO 'invalid' - esse precisa ser resetado manualmente
+                        # pois pode ser erro temporário (401 de auth expirada, etc)
                         if status == "invalid":
-                            key.status = KeyStatus.ACTIVE
+                            # Verificar se passou tempo suficiente para tentar novamente (30 min)
+                            if cooldown_until:
+                                cooldown_time = datetime.fromisoformat(cooldown_until)
+                                if datetime.now() > cooldown_time + timedelta(minutes=30):
+                                    key.status = KeyStatus.ACTIVE
+                                    key.cooldown_until = None
+                                    logger.info(f"Key {kid} reactivated after invalid cooldown period.")
+                                else:
+                                    key.status = KeyStatus.INVALID
+                            else:
+                                # Sem cooldown definido, tentar novamente
+                                key.status = KeyStatus.ACTIVE
                         else:
                             key.status = KeyStatus(status)
-                            
+                        
                         if cooldown_until:
                             key.cooldown_until = datetime.fromisoformat(cooldown_until)
                         key.request_count = req_count
@@ -146,10 +159,12 @@ class KeyManager:
                 now = datetime.now()
                 rate_limited = []
                 for k in active_keys:
+                    # Usar rate limit da chave ou global
+                    key_rate_limit = self._get_key_rate_limit(k.id)
                     minute_reqs = self._rate_counter.get(k.id, [])
                     minute_reqs = [t for t in minute_reqs if (now - t).total_seconds() < 60]
                     self._rate_counter[k.id] = minute_reqs
-                    if len(minute_reqs) < self.config.rate_limit_per_minute:
+                    if len(minute_reqs) < key_rate_limit:
                         rate_limited.append(k)
                 
                 if rate_limited:

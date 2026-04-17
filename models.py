@@ -14,6 +14,10 @@ class KeyConfig(BaseModel):
     id: str
     api_key: str
     priority: int = 1
+    # Rate limit configurável por chave (0 = usar valor global)
+    rate_limit_per_minute: int = 0
+    # Cooldown personalizado para esta chave (0 = usar valor global)
+    cooldown_minutes: int = 0
 
 
 class ProxyAuthConfig(BaseModel):
@@ -44,6 +48,8 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     file: Optional[str] = None
+    # Controle de logs sensíveis (headers, keys, payloads)
+    verbose: bool = False
 
 
 class StreamLimitsConfig(BaseModel):
